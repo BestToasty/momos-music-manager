@@ -41,6 +41,15 @@ const WORK_STALE_SECS: i64 = 1800;
 const LOGIN_BACKOFF_BASE: i64 = 60;
 const LOGIN_BACKOFF_MAX: i64 = 1800;
 
+/// Sentinel prefix for a native download's `deemix_uuid`. `advance_downloads`
+/// skips these rows — native jobs run on their own background task.
+const NATIVE_UUID_PREFIX: &str = "native:";
+
+/// True when a `deemix_uuid` marks a native job (not a deemix-queue item).
+fn is_native_uuid(uuid: Option<&str>) -> bool {
+    uuid.is_some_and(|u| u.starts_with(NATIVE_UUID_PREFIX))
+}
+
 /// Backoff for deemix login attempts. A dead or missing ARL must not retry —
 /// or log — every tick; the delay grows 60s → 1800s and resets on success.
 #[derive(Default)]
@@ -74,6 +83,19 @@ impl LoginBackoff {
     pub fn warn_missing_arl(&self) -> bool {
         !self.warned_missing_arl.swap(true, Ordering::SeqCst)
     }
+}
+
+/// Canned native download for tests: serves `bytes` for any track id/quality,
+/// so the native worker path can be exercised without an ARL or the network.
+#[derive(Debug, Clone)]
+pub struct NativeFake {
+    /// File bytes to hand back (must be a container `lofty` can tag).
+    pub bytes: Vec<u8>,
+    /// File extension to write them with (e.g. `"flac"`, `"mp3"`).
+    pub extension: String,
+    /// When true, a request for `Quality::Flac` fails with `NoLosslessTier`,
+    /// forcing the 320 fallback (tier-exercised path).
+    pub no_flac: bool,
 }
 
 /// Run forever, waking on the configured interval or when nudged by a new order.
@@ -153,6 +175,74 @@ pub async fn ensure_deemix_login(state: &Arc<AppState>) -> bool {
     }
 }
 
+/// Boxed, owned-input login future. Production is [`crate::deezer_dl::login`];
+/// tests inject their own so a failing login drives the backoff without the
+/// network.
+pub type NativeLoginFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<crate::deezer_dl::Session, crate::deezer_dl::Error>>
+            + Send,
+    >,
+>;
+
+/// Ensure a native Deezer session, honouring the native login backoff.
+///
+/// Returns whether the native path is ready to download. The backoff grows
+/// 60s → 1800s on repeated failures and resets on success. A missing ARL warns
+/// exactly once. The ARL is only ever handed to [`crate::deezer_dl::login`] —
+/// it never reaches a log line or an error message.
+///
+/// When [`AppState::native_fake`] is set (tests), no session is needed.
+pub async fn ensure_native_login(state: &Arc<AppState>) -> bool {
+    ensure_native_login_with(state, |arl| -> NativeLoginFuture {
+        Box::pin(async move { crate::deezer_dl::login(&arl).await })
+    })
+    .await
+}
+
+/// [`ensure_native_login`] with the login call injected.
+///
+/// Production passes [`crate::deezer_dl::login`]; tests inject a fake so a
+/// failing login can be exercised without touching the network. Everything else
+/// — the empty-ARL short-circuit, the session cache and the backoff — is shared
+/// with the production path.
+pub async fn ensure_native_login_with<L>(state: &Arc<AppState>, login: L) -> bool
+where
+    L: Fn(String) -> NativeLoginFuture,
+{
+    if state.native_fake.is_some() {
+        return true;
+    }
+    let arl = state.config.deemix_arl.trim();
+    if arl.is_empty() {
+        if state.native_login.warn_missing_arl() {
+            warn!("DEEMIX_ARL is not set — native Deezer downloads unavailable");
+        }
+        return false;
+    }
+    if state.native_session.read().await.is_some() {
+        return true;
+    }
+    let now = db::now();
+    if state.native_login.blocked(now) {
+        return false;
+    }
+    match login(arl.to_string()).await {
+        Ok(session) => {
+            state.native_login.note_success();
+            *state.native_session.write().await = Some(Arc::new(session));
+            info!("native Deezer session established");
+            true
+        }
+        Err(e) => {
+            let delay = state.native_login.note_failure(now);
+            // `{e}` is ARL-free by construction (deezer_dl renders no ARL).
+            warn!("native Deezer login failed ({e}) — next attempt in {delay}s");
+            false
+        }
+    }
+}
+
 /// Phase A: look each pending ISRC up on Deezer and submit it to deemix.
 ///
 /// Orders are accepted without limit; only the *dispatch* is bounded. The pending
@@ -195,7 +285,11 @@ pub async fn resolve_pending(state: &Arc<AppState>) -> Result<()> {
     // deemix needs a session before it accepts `addToQueue`. A failed login is
     // backed off so it cannot retry (or log) every tick; metadata resolution
     // below does not need deemix and still runs regardless.
-    let deemix_ready = ensure_deemix_login(state).await;
+    // Which backend handles resolved Deezer tracks (native vs. sidecar).
+    let backend = state.config.effective_backend();
+    // Only the sidecar backend talks to deemix; native needs no deemix session.
+    let deemix_ready =
+        backend == crate::config::DownloadBackend::Sidecar && ensure_deemix_login(state).await;
 
     for item in queued {
         let Some(track) = db::get_track(&state.pool, &item.reference).await? else {
@@ -275,6 +369,27 @@ pub async fn resolve_pending(state: &Arc<AppState>) -> Result<()> {
                     "info",
                     format!("{}: resolved — {title} / {artist}", track.isrc),
                 );
+
+                if backend == crate::config::DownloadBackend::Native {
+                    // Native path: without a session the track stays pending and is
+                    // retried next tick (no lease taken, no sentinel written).
+                    if !ensure_native_login(state).await {
+                        continue;
+                    }
+                    let lease = db::now() + state.config.download_timeout.as_secs() as i64;
+                    let uuid = format!("{NATIVE_UUID_PREFIX}{}", track.isrc);
+                    if let Err(e) =
+                        db::mark_downloading(&state.pool, &track.isrc, &uuid, lease).await
+                    {
+                        warn!("{}: mark downloading failed: {e:#}", track.isrc);
+                        continue;
+                    }
+                    state
+                        .logs
+                        .push("info", format!("{}: native download started", track.isrc));
+                    spawn_native_download(state.clone(), track);
+                    continue;
+                }
 
                 if !deemix_ready {
                     continue;
@@ -426,9 +541,204 @@ async fn finalize_external(state: &Arc<AppState>, track: &Track, src: &Path) -> 
     Ok(())
 }
 
+/// Map the configured `DEEMIX_BITRATE` (9/3/1) to a native [`deezer_dl::Quality`].
+pub fn wanted_quality(bitrate: u8) -> crate::deezer_dl::Quality {
+    use crate::deezer_dl::Quality;
+    match bitrate {
+        9 => Quality::Flac,
+        3 => Quality::Mp3_320,
+        _ => Quality::Mp3_128,
+    }
+}
+
+/// The fallback ladder for a wanted quality: the wanted tier first, then every
+/// lower tier. A lossless account cap steps down FLAC → 320 → 128.
+fn quality_ladder(wanted: crate::deezer_dl::Quality) -> Vec<crate::deezer_dl::Quality> {
+    use crate::deezer_dl::Quality::*;
+    match wanted {
+        Flac => vec![Flac, Mp3_320, Mp3_128],
+        Mp3_320 => vec![Mp3_320, Mp3_128],
+        Mp3_128 => vec![Mp3_128],
+    }
+}
+
+/// Attempt a download with the tier fallback: try the wanted quality, and on
+/// `NoLosslessTier` step down one rung. Any other error aborts immediately.
+/// Returns the bytes and the quality that actually succeeded (for the run-log).
+async fn download_with_fallback<F, Fut>(
+    wanted: crate::deezer_dl::Quality,
+    mut dl: F,
+) -> Result<(Vec<u8>, crate::deezer_dl::Quality), crate::deezer_dl::Error>
+where
+    F: FnMut(crate::deezer_dl::Quality) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, crate::deezer_dl::Error>>,
+{
+    use crate::deezer_dl::Error;
+    let mut last = Error::NoLosslessTier;
+    for q in quality_ladder(wanted) {
+        match dl(q).await {
+            Ok(bytes) => return Ok((bytes, q)),
+            Err(Error::NoLosslessTier) => {
+                last = Error::NoLosslessTier;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// Dispatch a native (`deezer_dl`) download onto a background task. The caller
+/// has already marked the row `downloading` with a `native:` sentinel + lease,
+/// so it has left the due set; the reaper re-queues it if the lease lapses.
+fn spawn_native_download(state: Arc<AppState>, track: Track) {
+    tokio::spawn(async move {
+        let key = track.isrc.clone();
+        let timeout = state.config.download_timeout.as_secs() as i64;
+        let _ = db::renew_lease(&state.pool, &key, db::now() + timeout).await;
+        match run_native_download(&state, &track).await {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("{key}: native download failed: {e:#}");
+                state
+                    .logs
+                    .push("warn", format!("{key}: native download failed: {e}"));
+                let policy = retry_policy(&state);
+                let _ = db::schedule_retry(&state.pool, &key, &format!("{e}"), &policy, db::now())
+                    .await;
+            }
+        }
+    });
+}
+
+/// The actual native acquisition, run on the background task: resolve the
+/// Deezer id, download the best available quality, write the ISRC tag, store the
+/// file and mark it ready.
+async fn run_native_download(state: &Arc<AppState>, track: &Track) -> Result<()> {
+    let cfg = &state.config;
+    let isrc = track.isrc.clone();
+
+    // Deezer id: set by `resolve_pending`; re-resolve when missing (recovery).
+    let deezer_id = match track.deezer_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => id.to_string(),
+        None => match deezer::lookup_isrc(&state.http, &cfg.deezer_base, &isrc).await? {
+            deezer::Lookup::Found { deezer_id, .. } => deezer_id,
+            deezer::Lookup::Absent { reason } => {
+                anyhow::bail!("absent on Deezer ({reason})")
+            }
+        },
+    };
+
+    let wanted = wanted_quality(cfg.deemix_bitrate);
+    let started = std::time::Instant::now();
+
+    let (bytes, used) = if let Some(fake) = state.native_fake.as_ref() {
+        // Test seam: canned bytes, no session/network. `no_flac` exercises the
+        // tier fallback without an account.
+        let fake = fake.clone();
+        download_with_fallback(wanted, move |q| {
+            let fake = fake.clone();
+            async move {
+                if fake.no_flac && q == crate::deezer_dl::Quality::Flac {
+                    Err(crate::deezer_dl::Error::NoLosslessTier)
+                } else {
+                    Ok(fake.bytes.clone())
+                }
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("native download failed: {e}"))?
+    } else {
+        let Some(session) = state.native_session.read().await.clone() else {
+            anyhow::bail!("native session not established");
+        };
+        let id = deezer_id.clone();
+        download_with_fallback(wanted, move |q| {
+            let session = session.clone();
+            let id = id.clone();
+            async move { crate::deezer_dl::download_track(&session, &id, q).await }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("native download failed: {e}"))?
+    };
+    let elapsed = started.elapsed();
+
+    // Write the bytes to a scratch file, tag it, then store it.
+    let safe = isrc.replace([':', '/'], "_");
+    let ext = used.extension().trim_start_matches('.');
+    let temp = cfg.data_dir.join(format!("native-{safe}.{ext}"));
+    tokio::fs::write(&temp, &bytes).await?;
+    if let Err(e) = tags::write_isrc(&temp, &isrc).await {
+        warn!("{isrc}: write_isrc failed: {e:#}");
+    }
+
+    let result = finalize_native(state, track, &temp, used, elapsed).await;
+    let _ = tokio::fs::remove_file(&temp).await;
+    result
+}
+
+/// Place a tagged native download into the store (`flac`/`320`/`128`, chosen by
+/// the quality that actually succeeded), mark the row ready and log the run.
+async fn finalize_native(
+    state: &Arc<AppState>,
+    track: &Track,
+    temp: &Path,
+    used: crate::deezer_dl::Quality,
+    elapsed: std::time::Duration,
+) -> Result<()> {
+    use crate::deezer_dl::Quality;
+    let cfg = &state.config;
+    let isrc = &track.isrc;
+
+    let (label, dst) = match used {
+        Quality::Flac => ("flac", cfg.flac_dir().join(format!("{isrc}.flac"))),
+        Quality::Mp3_320 => ("mp3-320", cfg.mp3_320_dir().join(format!("{isrc}.mp3"))),
+        Quality::Mp3_128 => ("mp3-128", cfg.mp3_128_dir().join(format!("{isrc}.mp3"))),
+    };
+    if let Some(parent) = dst.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::copy(temp, &dst).await?;
+    let path = dst.display().to_string();
+    let (pf, p320, p128) = match used {
+        Quality::Flac => (Some(path.as_str()), None, None),
+        Quality::Mp3_320 => (None, Some(path.as_str()), None),
+        Quality::Mp3_128 => (None, None, Some(path.as_str())),
+    };
+    db::mark_ready(&state.pool, isrc, label, pf, p320, p128).await?;
+    let vault_formats = match used {
+        Quality::Flac => "flac",
+        Quality::Mp3_320 => "320",
+        Quality::Mp3_128 => "128",
+    };
+    vault_download(state, isrc, "ready", Some(label), vault_formats).await;
+
+    let secs = elapsed.as_secs_f64();
+    info!(
+        isrc,
+        quality = label,
+        source = "native",
+        elapsed_ms = elapsed.as_millis() as u64,
+        "native download complete"
+    );
+    state.logs.push(
+        "info",
+        format!("{isrc}: ready (native, {label}, {secs:.1}s)"),
+    );
+    enqueue_transcode(state, isrc).await;
+    Ok(())
+}
+
 /// Phase B: poll deemix for the in-flight downloads and finalise them.
-async fn advance_downloads(state: &Arc<AppState>) -> Result<()> {
-    let inflight = db::downloading_tracks(&state.pool).await?;
+/// Public so tests can drive it directly.
+pub async fn advance_downloads(state: &Arc<AppState>) -> Result<()> {
+    // Native rows (`native:` sentinel) finalize on their own background task;
+    // only sidecar rows are polled against the deemix queue.
+    let inflight: Vec<Track> = db::downloading_tracks(&state.pool)
+        .await?
+        .into_iter()
+        .filter(|t| !is_native_uuid(t.deemix_uuid.as_deref()))
+        .collect();
     if inflight.is_empty() {
         return Ok(());
     }
@@ -1392,6 +1702,116 @@ mod tests {
         b.note_success();
         assert!(!b.blocked(1000));
         assert_eq!(b.note_failure(1000), 60);
+    }
+
+    #[test]
+    fn wanted_quality_maps_decode_bitrate() {
+        use crate::deezer_dl::Quality::*;
+        assert_eq!(wanted_quality(9), Flac);
+        assert_eq!(wanted_quality(3), Mp3_320);
+        assert_eq!(wanted_quality(1), Mp3_128);
+        // Anything else degrades to the safest tier.
+        assert_eq!(wanted_quality(0), Mp3_128);
+        assert_eq!(wanted_quality(255), Mp3_128);
+    }
+
+    #[test]
+    fn quality_ladder_steps_down_by_tier() {
+        use crate::deezer_dl::Quality::*;
+        assert_eq!(quality_ladder(Flac), vec![Flac, Mp3_320, Mp3_128]);
+        assert_eq!(quality_ladder(Mp3_320), vec![Mp3_320, Mp3_128]);
+        assert_eq!(quality_ladder(Mp3_128), vec![Mp3_128]);
+    }
+
+    #[tokio::test]
+    async fn download_falls_back_from_flac_to_320() {
+        use crate::deezer_dl::Quality::*;
+        let mut seen = Vec::new();
+        let (bytes, used) = download_with_fallback(Flac, |q| {
+            seen.push(q);
+            async move {
+                if q == Flac {
+                    Err(crate::deezer_dl::Error::NoLosslessTier)
+                } else {
+                    Ok(vec![b'x'])
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(used, Mp3_320);
+        assert_eq!(seen, vec![Flac, Mp3_320]);
+        assert_eq!(bytes, vec![b'x']);
+    }
+
+    #[tokio::test]
+    async fn download_falls_back_all_the_way_to_128() {
+        use crate::deezer_dl::Quality::*;
+        let (_, used) = download_with_fallback(Flac, |q| async move {
+            match q {
+                Flac | Mp3_320 => Err(crate::deezer_dl::Error::NoLosslessTier),
+                _ => Ok(vec![1u8]),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(used, Mp3_128);
+    }
+
+    #[tokio::test]
+    async fn download_aborts_on_a_hard_error_without_fallback() {
+        use crate::deezer_dl::Quality::*;
+        let mut seen = Vec::new();
+        let err = download_with_fallback(Flac, |q| {
+            seen.push(q);
+            async move { Err::<Vec<u8>, _>(crate::deezer_dl::Error::Api("boom".into())) }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::deezer_dl::Error::Api(_)));
+        assert_eq!(seen, vec![Flac], "must not step down on a hard error");
+    }
+
+    #[test]
+    fn native_uuid_sentinel_is_recognised() {
+        assert!(is_native_uuid(Some("native:USRC17607839")));
+        assert!(!is_native_uuid(Some("track_3135556_1")));
+        assert!(!is_native_uuid(None));
+    }
+
+    #[test]
+    fn native_login_backoff_grows_and_resets() {
+        // The native session has its own backoff, independent of deemix's.
+        let b = LoginBackoff::default();
+        assert!(!b.blocked(1000));
+        assert_eq!(b.note_failure(1000), 60);
+        assert!(b.blocked(1030));
+        assert!(!b.blocked(1061));
+        assert_eq!(b.note_failure(1000), 120);
+        for _ in 0..10 {
+            b.note_failure(1000);
+        }
+        assert_eq!(b.note_failure(1000), LOGIN_BACKOFF_MAX);
+        b.note_success();
+        assert!(!b.blocked(1000));
+        assert_eq!(b.note_failure(1000), 60);
+        assert!(b.warn_missing_arl());
+        assert!(!b.warn_missing_arl());
+    }
+
+    /// The native login-failure warning is assembled from the error's Display,
+    /// which carries no ARL — the exact invariant the worker relies on.
+    #[test]
+    fn native_login_error_messages_never_carry_the_arl() {
+        let arl = "this-is-a-fake-arl-zzz999";
+        for err in [
+            crate::deezer_dl::Error::InvalidArl,
+            crate::deezer_dl::Error::Api("deezer api unreachable".to_string()),
+        ] {
+            let msg = format!("native Deezer login failed ({err}) — next attempt in 60s");
+            assert!(!msg.contains(arl), "ARL leaked: {msg}");
+            assert!(!msg.contains("zzz999"), "ARL fragment leaked: {msg}");
+        }
     }
 
     #[test]
