@@ -1,26 +1,44 @@
 // pull-playlists.ts
-// Holt alle Playlists aus deiner Apple-Music-Bibliothek inkl. Songs
-// und ergänzt pro Song die vollen Katalog-Metadaten. Ergebnis: playlists.json
+// Holt Playlists aus deiner Apple-Music-Bibliothek (privat, per User-Token)
+// und ergänzt pro Song die Katalog-Metadaten (inkl. ISRC).
 //
-// Benötigt zwei Umgebungsvariablen (NICHT in den Code schreiben):
-//   APPLE_DEV_TOKEN   -> der Bearer-Token (eyJ0eXAi...), den dir der Scraper liefert
-//   APPLE_USER_TOKEN  -> dein media-user-token aus dem Browser-Cookie
-// Optional:
-//   APPLE_STOREFRONT  -> Ländercode, Standard: de
+// Ausgabe:
+//   playlists.raw.json   vollständige Antworten (Archiv, NICHT ins Repo!)
+//   playlists.slim.json  schlanke, flache Variante (später an Vertrag §3a anpassen)
+//
+// Umgebungsvariablen (nie in den Code schreiben):
+//   APPLE_DEV_TOKEN    Bearer-Token (eyJ0eXAi...) vom Scraper
+//   APPLE_USER_TOKEN   dein media-user-token aus dem Browser-Cookie
+//   APPLE_STOREFRONT   optional, Ländercode, Standard: de
+//   APPLE_ONLY         optional, Playlist-Namen, kommagetrennt (Alternative zu --only)
+//
+// Aufruf:
+//   npx tsx pull-playlists.ts                   alle Playlists
+//   npx tsx pull-playlists.ts --list            nur auflisten (Name, ID, Songanzahl)
+//   npx tsx pull-playlists.ts --only "all,Gym"  nur diese Playlists (Name, ohne Groß/Klein)
 
 import { writeFile } from 'node:fs/promises';
 
 const BASE = 'https://amp-api.music.apple.com';
-const DEV_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6IldlYlBsYXlLaWQifQ.eyJpc3MiOiJBTVBXZWJQbGF5IiwiaWF0IjoxNzkzOTAwNzA4LCJleHAiOjE3OTk5NDg3MDgsInJvb3RfaHR0cHNfb3JpZ2luIjpbImFwcGxlLmNvbSJdfQ.7L-PYJHjO8PpFdhKS-OSkf_snyFvg5cq-JDERUs_N_UcUX9Vk0kf1WLatgDeEvhB_Arg1b5Tl-99G1v6hUwH0A";
-const USER_TOKEN = "0.Aq2pUPKYRV3jhOZu+ogh0uh2NvphXIz7yLGKVfsoddDYRB/vF+Sm8kOvsAjDdOEQgIVHowlJs4F/FwyKtQCZGQpTWpnykUvWSxtvp/hNow09WyRBIBG8XVUdkWq9lx9Hu6lYOThqFGGKH0vU4Me5J4NlkLHMVGcnRs/R72ofEXKqmVEaxQz4NivDnVrJq4YDdrb+Hto5irTvSp0Ot/PKiknoK57U90OUaVooqbvZAv9Sf/dJUw==";
+const DEV_TOKEN = process.env.APPLE_DEV_TOKEN;
+const USER_TOKEN = process.env.APPLE_USER_TOKEN;
 const STOREFRONT = process.env.APPLE_STOREFRONT ?? 'de';
+
+const args = process.argv.slice(2);
+const LIST_ONLY = args.includes('--list');
+const onlyIdx = args.indexOf('--only');
+const onlyRaw = onlyIdx >= 0 ? args[onlyIdx + 1] : process.env.APPLE_ONLY;
+const ONLY = onlyRaw
+    ?.split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 
 if (!DEV_TOKEN) throw new Error('APPLE_DEV_TOKEN ist nicht gesetzt');
 if (!USER_TOKEN) throw new Error('APPLE_USER_TOKEN ist nicht gesetzt');
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Eine Anfrage an die API (mit einfachem Retry bei 429 = zu viele Anfragen)
+// Eine Anfrage an die API (Retry bei 429 = zu viele Anfragen)
 async function apiGet(path: string, retries = 3): Promise<any> {
     const res = await fetch(BASE + path, {
         headers: {
@@ -35,6 +53,12 @@ async function apiGet(path: string, retries = 3): Promise<any> {
     if (res.status === 429 && retries > 0) {
         await sleep(2000);
         return apiGet(path, retries - 1);
+    }
+    if (res.status === 401 || res.status === 403) {
+        throw new Error(
+            `Token abgelehnt (HTTP ${res.status}). Dev-Token oder User-Token ist ungültig/abgelaufen. ` +
+                `Hol dir einen neuen media-user-token aus dem Browser (Cookie auf music.apple.com).`
+        );
     }
     if (!res.ok) {
         throw new Error(`HTTP ${res.status} bei ${path}`);
@@ -54,7 +78,7 @@ async function getAll(path: string): Promise<any[]> {
     return items;
 }
 
-// Songs aus dem Katalog in Blöcken nachladen -> Map von Katalog-ID zu Song
+// Songs aus dem Katalog in Blöcken nachladen -> Map: Katalog-ID -> Song
 async function getCatalogSongs(ids: string[]): Promise<Map<string, any>> {
     const map = new Map<string, any>();
     const unique = [...new Set(ids)];
@@ -62,24 +86,48 @@ async function getCatalogSongs(ids: string[]): Promise<Map<string, any>> {
     for (let i = 0; i < unique.length; i += 100) {
         const chunk = unique.slice(i, i + 100).join(',');
         try {
-            const json = await apiGet(
-                `/v1/catalog/${STOREFRONT}/songs?ids=${chunk}&include=albums,artists`
-            );
+            // nur Album-Infos mitladen; Künstler-Ballast (Alben des Künstlers) bewusst weggelassen
+            const json = await apiGet(`/v1/catalog/${STOREFRONT}/songs?ids=${chunk}&include=albums`);
             for (const song of json.data ?? []) map.set(song.id, song);
         } catch (e) {
+            if (String(e).includes('Token abgelehnt')) throw e; // sofort abbrechen
             console.warn(`  Katalog-Block ab ${i} fehlgeschlagen:`, String(e));
         }
-        await sleep(200); // kleine Pause, um nicht ins Rate-Limit zu laufen
+        await sleep(200);
     }
     return map;
 }
 
 async function main() {
     console.log('Hole Playlists ...');
-    const playlists = await getAll('/v1/me/library/playlists?limit=100');
-    console.log(`${playlists.length} Playlists gefunden.\n`);
+    const all = await getAll('/v1/me/library/playlists?limit=100');
+    console.log(`${all.length} Playlists gefunden.\n`);
 
-    const result: any[] = [];
+    // --list: nur auflisten, ohne Songs zu laden
+    if (LIST_ONLY) {
+        for (const pl of all) {
+            console.log(`${(pl.attributes?.name ?? '(ohne Name)').padEnd(40)} ${pl.id}`);
+        }
+        console.log('\nTipp: --only "name1,name2" lädt gezielt einzelne Playlists.');
+        return;
+    }
+
+    const playlists = ONLY
+        ? all.filter((p) => ONLY.includes((p.attributes?.name ?? '').toLowerCase()))
+        : all;
+
+    if (ONLY) {
+        console.log(`Filter aktiv: ${playlists.length} von ${all.length} Playlists ausgewählt.\n`);
+        if (playlists.length === 0) {
+            console.log('Keine Playlist passt. Mit --list siehst du die genauen Namen.');
+            return;
+        }
+    }
+
+    const raw: any[] = [];
+    const slim: any[] = [];
+    let totalTracks = 0;
+    let withIsrc = 0;
 
     for (const [index, pl] of playlists.entries()) {
         const name = pl.attributes?.name ?? '(ohne Name)';
@@ -90,27 +138,57 @@ async function main() {
         try {
             tracks = await getAll(`/v1/me/library/playlists/${pl.id}/tracks?limit=100`);
         } catch (e) {
+            if (String(e).includes('Token abgelehnt')) throw e;
             console.warn('  Songs konnten nicht geladen werden:', String(e));
         }
 
-        // Katalog-IDs der Songs sammeln und volle Metadaten holen
+        // Katalog-IDs sammeln und volle Metadaten holen
         const catalogIds = tracks
             .map((t) => t.attributes?.playParams?.catalogId)
             .filter((id): id is string => Boolean(id));
         const catalog = await getCatalogSongs(catalogIds);
 
-        result.push({
+        const merged = tracks.map((t) => {
+            const catalogId: string | null = t.attributes?.playParams?.catalogId ?? null;
+            return {
+                libraryId: t.id,
+                catalogId,
+                library: t.attributes,
+                catalog: catalogId ? (catalog.get(catalogId) ?? null) : null,
+            };
+        });
+
+        raw.push({
             id: pl.id,
             name,
             attributes: pl.attributes,
-            trackCount: tracks.length,
-            tracks: tracks.map((t) => {
-                const catalogId = t.attributes?.playParams?.catalogId;
+            trackCount: merged.length,
+            tracks: merged,
+        });
+
+        slim.push({
+            id: pl.id,
+            name,
+            trackCount: merged.length,
+            tracks: merged.map((t, position) => {
+                const c = t.catalog?.attributes;
+                const l = t.library;
+                const album = t.catalog?.relationships?.albums?.data?.[0]?.attributes;
+                const isrc: string | null = c?.isrc ?? null;
+                totalTracks++;
+                if (isrc) withIsrc++;
                 return {
-                    libraryId: t.id,
-                    catalogId: catalogId ?? null,
-                    library: t.attributes,                       // Daten aus deiner Bibliothek
-                    catalog: catalogId ? catalog.get(catalogId) ?? null : null, // volle Katalog-Metadaten
+                    position,
+                    title: c?.name ?? l?.name ?? null,
+                    artist: c?.artistName ?? l?.artistName ?? null,
+                    album: c?.albumName ?? l?.albumName ?? null,
+                    isrc,
+                    durationMs: c?.durationInMillis ?? l?.durationInMillis ?? null,
+                    releaseDate: c?.releaseDate ?? l?.releaseDate ?? null,
+                    genres: c?.genreNames ?? l?.genreNames ?? [],
+                    appleCatalogId: t.catalogId,
+                    upc: album?.upc ?? null,
+                    url: c?.url ?? null,
                 };
             }),
         });
@@ -118,11 +196,16 @@ async function main() {
         await sleep(200);
     }
 
-    await writeFile('playlists.json', JSON.stringify(result, null, 2), 'utf8');
-    console.log('\nFertig. Gespeichert in playlists.json');
+    await writeFile('playlists.raw.json', JSON.stringify(raw, null, 2), 'utf8');
+    await writeFile('playlists.slim.json', JSON.stringify(slim, null, 2), 'utf8');
+
+    console.log('\nFertig.');
+    console.log(`  ${playlists.length} Playlists, ${totalTracks} Songs`);
+    console.log(`  mit ISRC: ${withIsrc}, ohne ISRC: ${totalTracks - withIsrc}`);
+    console.log('  Gespeichert: playlists.raw.json, playlists.slim.json');
 }
 
 main().catch((e) => {
-    console.error('Fehler:', e);
+    console.error('Fehler:', e instanceof Error ? e.message : e);
     process.exit(1);
 });
